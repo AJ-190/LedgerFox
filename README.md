@@ -235,7 +235,7 @@ implementation.
 
 **Addy Samuel**  
 Backend Engineer — The Unfathomable Builder 🫥  
-[GitHub](https://github.com/AJ-190) · [LinkedIn](https://linkedin.com/in/your-profile)
+[GitHub](https://github.com/AJ-190) · [LinkedIn](https://www.linkedin.com/in/addy-samuel-010302378/)
 
 ---
 
