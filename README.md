@@ -231,6 +231,14 @@ implementation.
 
 ---
 
+## Author
+
+**Addy Samuel**  
+Backend Engineer — The Unfathomable Builder 🫥  
+[GitHub](https://github.com/AJ-190) · [LinkedIn](https://linkedin.com/in/your-profile)
+
+---
+
 ## License
 
 Private. All rights reserved.
