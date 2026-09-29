@@ -21,6 +21,8 @@ systems like Stripe or Paystack.
 | Migrations | Alembic |
 | Password hashing | Argon2 via passlib |
 | Tokens | PyJWT (HS256) |
+| Transactional email | External notifier over HTTP (`httpx`) |
+| OTP store | Redis, keys carry a TTL |
 | Server | Uvicorn |
 
 ---
@@ -39,10 +41,13 @@ src/
 │   └── database.py    Declarative Base, async engine, session factory, get_db dependency
 ├── auth/
 │   ├── router.py      /auth endpoints — the HTTP surface
-│   ├── service.py     Registration and login logic
+│   ├── service.py     Registration, login, and OTP logic
 │   ├── schemas.py     Request/response contracts, password strength validator
+│   ├── otp.py         OTP generation, Redis storage, verification
 │   ├── utils.py       Argon2 hashing, JWT generation
 │   └── dependencies.py  Shared FastAPI dependencies (role guards go here)
+├── notify/
+│   └── utils.py       Hands the OTP to the external delivery service over HTTP
 ├── users/
 │   ├── model.py       ORM definition of the users table
 │   └── router.py      User endpoints
@@ -82,6 +87,36 @@ SECRET_KEY=generate-a-long-random-string
 | `ALGORITHM` | no | `HS256` | JWT signing algorithm |
 | `ACCESS_TOKEN_TIME_MINUTES` | no | `60` | Access token lifetime, in minutes |
 | `REFRESH_TOKEN_TIME_MINUTES` | no | `10080` | Refresh token lifetime (7 days), in minutes |
+| `NOTIFIER_URL` | yes | — | The external service endpoint that renders and sends the code. |
+| `NOTIFIER_API_KEY` | yes | — | Sent as `Authorization: Bearer <key>`. |
+| `NOTIFIER_FROM` | yes | — | Sender address passed through to the notifier. |
+| `NOTIFIER_FROM_NAME` | no | `LedgerFox` | Display name for the sender. |
+| `NOTIFIER_TIMEOUT` | no | `10` | Seconds before the notifier call is abandoned. |
+| `OTP_LENGTH` | no | `6` | Digits in the code. |
+| `OTP_EXPIRY_SECONDS` | no | `300` | How long a code stays valid. |
+| `OTP_MAX_ATTEMPTS` | no | `5` | Wrong guesses before the code is destroyed. |
+| `OTP_RESEND_COOLDOWN` | no | `60` | Minimum seconds between codes for one address. |
+
+**The notifier contract.** LedgerFox owns the code; the external service owns delivery.
+`src/notify/utils.py` POSTs JSON to `NOTIFIER_URL` and is responsible for nothing else —
+no templates, no SMTP, no HTML. The body is:
+
+```json
+{
+  "to": "you@example.com",
+  "name": "Ada Lovelace",
+  "code": "481902",
+  "subject": "LedgerFox verification code",
+  "from": "no-reply@ledgerfox.com",
+  "from_name": "LedgerFox",
+  "expires_in_seconds": 300
+}
+```
+
+The `code` arrives in plaintext, because the recipient has to read it. Any non-2xx
+response raises, and `send_otp` returns `503` — the code is deleted from Redis so a
+message that never went out cannot be guessed later. If your provider expects a different
+body shape or a different auth scheme, that is the one function to edit.
 
 **Getting `DATABASE_URL` right.** SQLAlchemy reads the scheme as `<dialect>+<driver>`, in
 that order. `postgresql` is the dialect; `asyncpg` is the driver. Reversing them produces
@@ -109,6 +144,8 @@ empty database is enough to get going. Interactive API docs are then at
 | `GET` | `/` | no | Health check |
 | `POST` | `/auth/register_account` | no | Create an account. Enforces password strength. |
 | `POST` | `/auth/login` | no | Exchange credentials for a token pair. `username` accepts email **or** phone. |
+| `POST` | `/auth/send_otp` | no | Email a verification code. `202` either way. |
+| `POST` | `/auth/verify_otp` | no | Exchange the code for `is_verified: true`. |
 
 Both auth endpoints take and return JSON. Login additionally accepts
 `OAuth2PasswordRequestForm`, so the **Authorize** button in `/docs` works.
@@ -137,6 +174,33 @@ Field names follow the OAuth 2.0 convention (`access_token`, `refresh_token`,
 At least 8 characters, containing at least one digit, one lowercase letter, one uppercase
 letter, and one special character. Enforced by a validator in `src/auth/schemas.py`, so it
 holds for every entry point rather than only the HTTP layer.
+
+### Email verification
+
+`POST /auth/send_otp` mails a six-digit code, and `POST /auth/verify_otp` exchanges it for
+`is_verified: true` on the user row.
+
+```bash
+curl -X POST http://127.0.0.1:8000/auth/send_otp \
+  -H 'Content-Type: application/json' \
+  -d '{"email": "you@example.com"}'
+
+curl -X POST http://127.0.0.1:8000/auth/verify_otp \
+  -H 'Content-Type: application/json' \
+  -d '{"email": "you@example.com", "code": "481902"}'
+```
+
+The code is held in Redis, never in Postgres. Redis holds three keys per address:
+
+| Key | Value | TTL |
+|---|---|---|
+| `otp:code:<email>` | `HMAC-SHA256(SECRET_KEY, email:code)` | `OTP_EXPIRY_SECONDS` |
+| `otp:attempts:<email>` | Wrong-guess counter | `OTP_EXPIRY_SECONDS` |
+| `otp:cooldown:<email>` | Resend throttle | `OTP_RESEND_COOLDOWN` |
+
+Nothing needs purging: every key expires on its own, so a restart costs nothing and a stale
+code cannot outlive its window. The address is lowercased before it becomes a key, so
+`You@Example.com` and `you@example.com` cannot each hold a live code.
 
 ---
 
@@ -184,6 +248,18 @@ explicitly granted.
   response does not reveal whether an account exists.
 - `password` is modelled as `SecretStr` in schemas, so it is excluded from logs and
   `repr` and must be explicitly unwrapped with `.get_secret_value()` to be read.
+- `NOTIFIER_API_KEY` is a `SecretStr` for the same reason, and is sent in the
+  `Authorization` header only — never in the request body.
+- **The OTP is not stored in plaintext.** Redis holds an HMAC keyed with `SECRET_KEY`, so a
+  dump of the keyspace does not yield usable codes. Comparison is `hmac.compare_digest`,
+  which is constant-time, and the guess counter caps online brute force at
+  `OTP_MAX_ATTEMPTS` per code.
+- **`send_otp` does not confirm whether an account exists.** An unknown address gets the
+  same `202` and the same body as a known one, and the cooldown is set either way, so the
+  endpoint is not an account-enumeration oracle. `verify_otp` is allowed to be blunt, since
+  by then the caller already holds a secret.
+- Codes are single-use. A successful verify deletes the code and the counter, so a captured
+  request cannot be replayed.
 
 ---
 
@@ -196,13 +272,15 @@ explicitly granted.
 | Registration | Done |
 | Login, JWT issuance | Done |
 | Password hashing | Done, but synchronous — blocks the event loop |
+| OTP delivery via external notifier | Done |
+| OTP request, verify, `is_verified` | Done |
 | Organisation & `org_members` | Stub |
 | Role / capability guards | Stub |
 | Payments, payouts, settlement | Not started |
 | Test suite | Not started |
 
-`src/organization/`, `src/auth/dependencies.py` are empty placeholders awaiting
-implementation.
+`src/organization/` is an empty placeholder awaiting implementation. `dependencies.py` now
+holds the Redis dependency; the role guards are still to come.
 
 ### Known issues
 
@@ -211,7 +289,21 @@ implementation.
   Wrap it in `anyio.to_thread.run_sync` or Starlette's `run_in_threadpool`.
 - **Response field / column mismatch.** `RegisterAccountResponse.is_verify` does not match
   the ORM column `is_verified`. Because the field carries a default this fails silently and
-  always reports `false`, including for verified users.
+  always reports `false`, including for verified users. `register_account` therefore still
+  reports `is_verify: false` after a successful `verify_otp`.
+- **The notifier call is awaited inline.** `send_otp` blocks on the external service
+  inside the request, so a slow or hanging notifier holds the connection open for up to
+  `NOTIFIER_TIMEOUT`. Moving it to Celery, already pinned, would decouple the two.
+- **The per-IP limiter is a single shared counter.** `auth_rate_limiter` keys on IP alone, so
+  one abusive client throttles every user behind the same NAT. Keying it on IP *and*
+  submitted address would fix it.
+- **A send failure is a `503`, which confirms the address exists.** Everywhere else this
+  endpoint is deliberately indistinguishable for known and unknown addresses. This is the
+  one place the rule is broken, chosen so that a misconfigured notifier is visible rather
+  than silently swallowing every code. Worth revisiting if enumeration matters more.
+- **No transactional record of codes.** Redis holds the live code and then forgets it. An
+  audit requirement — "prove this address was verified, and when" — wants a Postgres
+  `otp_codes` table written alongside.
 - **`requirements.txt` is a full `pip freeze`.** It pins transitive and unrelated packages
   (pandas, celery, reportlab, redis). It should be reduced to direct dependencies.
 - **`.env.example` is git-ignored** by the current `.gitignore`, so contributors have no

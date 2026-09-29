@@ -3,6 +3,8 @@ from datetime import datetime
 from typing import Optional
 import re
 
+from src.config import settings
+
 
 class RegisterAccount(BaseModel):
     first_name: str
@@ -53,4 +55,32 @@ class LoginResponse(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OTPRequest(BaseModel):
+    email: EmailStr
+
+
+class OTPRequestResponse(BaseModel):
+    message: str
+    expires_in: int
+
+
+class OTPVerify(BaseModel):
+    email: EmailStr
+    code: str
+
+    @field_validator("code")
+    @classmethod
+    def validate(cls, value):
+        if not value.isdigit() or len(value) != settings.OTP_LENGTH:
+            raise ValueError(f"Code must be exactly {settings.OTP_LENGTH} digits")
+        return value
+
+
+class OTPVerifyResponse(BaseModel):
+    email: EmailStr
+    is_verified: bool
+
     model_config = ConfigDict(from_attributes=True)

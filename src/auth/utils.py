@@ -37,4 +37,8 @@ def TokenGen(user: dict, expire: Optional[timedelta] = None, refresh: bool = Fal
         "exp": now + expire_delta,
     }
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def TokenDecode(token: str) -> dict:
+    return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
     
